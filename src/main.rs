@@ -1,8 +1,6 @@
-use std::io;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-
-//struct Server {}
+use std::{io, thread};
 
 fn handle(mut stream: TcpStream) -> io::Result<()> {
     let mut buffer = [0u8; 1024];
@@ -15,36 +13,45 @@ fn handle(mut stream: TcpStream) -> io::Result<()> {
     }
 }
 
-fn main() -> std::io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:6380")?;
-    println!("Server listening on port 6380...");
-
+fn serve(listener: TcpListener) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(e) = handle(stream) {
-                    eprintln!("connection error: {e}");
-                }
+                let peer = stream
+                    .peer_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "unknown".to_string());
+                eprintln!("connected {peer}");
+                thread::spawn(move || match handle(stream) {
+                    Ok(()) => eprintln!("disconnected {peer}"),
+                    Err(e) => eprintln!("connection error {peer}: {e}"),
+                });
             }
-            Err(e) => eprintln!("connection failed: {}", e),
+            Err(e) => eprintln!("connection failed {e}"),
         }
     }
+}
+
+fn main() -> io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:6380")?;
+    println!("Server listening on port 6380...");
+    serve(listener);
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
+    use std::{
+        net::Shutdown,
+        sync::{Arc, Barrier},
+        time::Duration,
+    };
 
     fn spawn_server() -> std::net::SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        thread::spawn(move || {
-            for stream in listener.incoming() {
-                let _ = handle(stream.unwrap());
-            }
-        });
+        thread::spawn(move || serve(listener));
         addr
     }
 
@@ -99,8 +106,6 @@ mod tests {
         assert_eq!(&got, b"still alive\n");
     }
 
-    use std::net::Shutdown; // add this to the test module's imports
-
     #[test]
     fn closing_write_side_ends_session_after_echo() {
         let addr = spawn_server();
@@ -145,5 +150,77 @@ mod tests {
 
         assert_eq!(got.len(), payload.len());
         assert!(got == payload);
+    }
+
+    #[test]
+    fn two_clients_at_once() {
+        let addr = spawn_server();
+
+        let mut client1 = TcpStream::connect(addr).unwrap();
+        let mut client2 = TcpStream::connect(addr).unwrap();
+
+        client2
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client2.write_all(b"hello2\n").unwrap();
+        let mut got2 = [0u8; 7];
+        client2.read_exact(&mut got2).unwrap();
+        assert_eq!(&got2, b"hello2\n");
+
+        client1
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client1.write_all(b"hello1\n").unwrap();
+        let mut got1 = [0u8; 7];
+        client1.read_exact(&mut got1).unwrap();
+        assert_eq!(&got1, b"hello1\n");
+    }
+
+    #[test]
+    fn twenty_clients_each_get_their_own_echo() {
+        const N: usize = 20;
+        let addr = spawn_server();
+        let barrier = Arc::new(Barrier::new(N));
+
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let mut c = TcpStream::connect(addr).unwrap();
+                    c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+                    barrier.wait();
+
+                    let msg = format!("client-{i}\n");
+                    c.write_all(msg.as_bytes()).unwrap();
+                    let mut got = vec![0u8; msg.len()];
+                    c.read_exact(&mut got).unwrap();
+                    assert_eq!(&got, msg.as_bytes());
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn server_survives_client_that_drops_with_unread_data() {
+        let addr = spawn_server();
+
+        {
+            let mut rude = TcpStream::connect(addr).unwrap();
+            rude.write_all(&[7u8; 64 * 1024]).unwrap();
+        }
+
+        thread::sleep(Duration::from_millis(100));
+
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        c.write_all(b"alive\n").unwrap();
+        let mut got = [0u8; 6];
+        c.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"alive\n");
     }
 }
