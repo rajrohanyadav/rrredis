@@ -1,3 +1,5 @@
+mod resp;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::time::Duration;
@@ -5,9 +7,15 @@ use std::{io, thread};
 
 const MAX_LINE: u64 = 1024 * 1024;
 const DRAIN_LIMIT: u64 = 64 * 1024;
-const ERR_LINE_TOO_LONG: &[u8] = b"-ERR line too long\r\n";
-const ERR_UNKNOWN_COMMAND: &[u8] = b"-ERR unknown command\r\n";
-const ERR_INVALID_UTF_8: &[u8] = b"-ERR invalid utf-8\r\n";
+const ERR_LINE_TOO_LONG: &str = "ERR line too long";
+const ERR_UNKNOWN_COMMAND: &str = "ERR unknown command";
+const ERR_INVALID_UTF_8: &str = "ERR invalid utf-8";
+
+fn encode_value(v: &resp::Value) -> Vec<u8> {
+    let mut out = vec![];
+    v.encode(&mut out).expect("writing to a vec cannot fail");
+    out
+}
 
 fn reply(line: &str) -> Vec<u8> {
     let line = line.trim();
@@ -15,16 +23,15 @@ fn reply(line: &str) -> Vec<u8> {
     let cmd = parts.next().unwrap_or("");
     let rest = parts.next().unwrap_or("").trim_start();
 
-    if cmd.eq_ignore_ascii_case("PING") {
-        b"+PONG\r\n".to_vec()
+    let value = if cmd.eq_ignore_ascii_case("PING") {
+        resp::Value::Simple("PONG".into())
     } else if cmd.eq_ignore_ascii_case("ECHO") {
-        let mut out = Vec::with_capacity(rest.len() + 2);
-        out.extend_from_slice(rest.as_bytes());
-        out.extend_from_slice(b"\r\n");
-        out
+        resp::Value::Simple(rest.into())
     } else {
-        ERR_UNKNOWN_COMMAND.to_vec()
-    }
+        resp::Value::Error(ERR_UNKNOWN_COMMAND.into())
+    };
+
+    encode_value(&value)
 }
 
 fn handle(stream: TcpStream) -> io::Result<()> {
@@ -37,7 +44,9 @@ fn handle(stream: TcpStream) -> io::Result<()> {
         let n = match (&mut reader).take(MAX_LINE).read_line(&mut line) {
             Ok(n) => {
                 if n as u64 == MAX_LINE && !line.ends_with('\n') {
-                    writer.write_all(ERR_LINE_TOO_LONG)?;
+                    writer.write_all(&encode_value(&resp::Value::Error(
+                        ERR_LINE_TOO_LONG.into(),
+                    )))?;
                     stream.shutdown(Shutdown::Write)?;
                     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
                     let _ = io::copy(&mut (&mut reader).take(DRAIN_LIMIT), &mut io::sink());
@@ -46,7 +55,9 @@ fn handle(stream: TcpStream) -> io::Result<()> {
                 n
             }
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
-                writer.write_all(ERR_INVALID_UTF_8)?;
+                writer.write_all(&encode_value(&resp::Value::Error(
+                    ERR_INVALID_UTF_8.into(),
+                )))?;
                 continue;
             }
             Err(e) => return Err(e),
@@ -115,9 +126,9 @@ mod tests {
 
         let mut second = TcpStream::connect(addr).unwrap();
         second.write_all(b"echo still alive\n").unwrap();
-        let mut got = [0u8; 13];
+        let mut got = [0u8; 14];
         second.read_exact(&mut got).unwrap();
-        assert_eq!(&got, b"still alive\r\n");
+        assert_eq!(&got, b"+still alive\r\n");
     }
 
     #[test]
@@ -130,7 +141,7 @@ mod tests {
 
         let mut got = Vec::new();
         client.read_to_end(&mut got).unwrap(); // reads until the server closes
-        assert_eq!(got, b"bye\r\n");
+        assert_eq!(got, b"+bye\r\n");
     }
 
     #[test]
@@ -149,7 +160,7 @@ mod tests {
                     barrier.wait();
 
                     let msg = format!("echo client-{i}\n");
-                    let expected = format!("client-{i}\r\n");
+                    let expected = format!("+client-{i}\r\n");
                     c.write_all(msg.as_bytes()).unwrap();
                     let mut got = vec![0u8; expected.len()];
                     c.read_exact(&mut got).unwrap();
@@ -177,9 +188,9 @@ mod tests {
         let mut c = TcpStream::connect(addr).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         c.write_all(b"echo alive\n").unwrap();
-        let mut got = [0u8; 7];
+        let mut got = [0u8; 8];
         c.read_exact(&mut got).unwrap();
-        assert_eq!(&got, b"alive\r\n");
+        assert_eq!(&got, b"+alive\r\n");
     }
 
     #[test]
@@ -190,13 +201,13 @@ mod tests {
             ("PiNg", b"+PONG\r\n"),
             ("PING\r\n", b"+PONG\r\n"),
             ("  PING  ", b"+PONG\r\n"),
-            ("ECHO hi", b"hi\r\n"),
-            ("echo hello world", b"hello world\r\n"),
-            ("echo    padded", b"padded\r\n"),
-            ("ECHO", b"\r\n"),
-            ("FOO", ERR_UNKNOWN_COMMAND),
-            ("", ERR_UNKNOWN_COMMAND),
-            ("\r\n", ERR_UNKNOWN_COMMAND),
+            ("ECHO hi", b"+hi\r\n"),
+            ("echo hello world", b"+hello world\r\n"),
+            ("echo    padded", b"+padded\r\n"),
+            ("ECHO", b"+\r\n"),
+            ("FOO", b"-ERR unknown command\r\n"),
+            ("", b"-ERR unknown command\r\n"),
+            ("\r\n", b"-ERR unknown command\r\n"),
         ];
 
         for (input, expected) in cases {
@@ -216,7 +227,7 @@ mod tests {
         let mut got = vec![];
 
         client.read_to_end(&mut got).unwrap();
-        assert_eq!(got.as_slice(), ERR_LINE_TOO_LONG);
+        assert_eq!(got.as_slice(), b"-ERR line too long\r\n");
     }
 
     #[test]
@@ -234,7 +245,8 @@ mod tests {
         assert_eq!(request.len() as u64, MAX_LINE);
         client.write_all(&request).unwrap();
 
-        let mut expected = payload;
+        let mut expected = vec![b'+'];
+        expected.extend_from_slice(&payload);
         expected.extend_from_slice(b"\r\n");
         let mut got = vec![0u8; expected.len()];
         client.read_exact(&mut got).unwrap();
@@ -257,7 +269,7 @@ mod tests {
 
         let mut got = Vec::new();
         client.read_to_end(&mut got).unwrap();
-        assert_eq!(got.as_slice(), ERR_LINE_TOO_LONG);
+        assert_eq!(got.as_slice(), b"-ERR line too long\r\n");
     }
 
     #[test]
@@ -270,7 +282,7 @@ mod tests {
 
         let payload = "x".repeat(10_000);
         let request = format!("echo {payload}\n");
-        let expected = format!("{payload}\r\n");
+        let expected = format!("+{payload}\r\n");
 
         for _ in 0..200 {
             client.write_all(request.as_bytes()).unwrap();
@@ -291,7 +303,7 @@ mod tests {
         client.write_all(b"\xff\xfe\n").unwrap();
         client.write_all(b"PING\n").unwrap();
 
-        let mut expected = ERR_INVALID_UTF_8.to_vec();
+        let mut expected = b"-ERR invalid utf-8\r\n".to_vec();
         expected.extend_from_slice(b"+PONG\r\n");
         let mut got = vec![0u8; expected.len()];
         client.read_exact(&mut got).unwrap();
